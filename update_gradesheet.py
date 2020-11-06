@@ -1,104 +1,112 @@
 import nbgrader, csv, codecs, sys, os, shutil
 from nbgrader.apps import NbGraderAPI
 import zipfile
-verbose = False
+import pandas as pd
+
+import logging
+
+logger = logging.getLogger('moodle_nbgrader')
+logger.setLevel(logging.INFO)
+
 def zip(out, root):
     shutil.make_archive(out, 'zip', root)
+
+def add_feedback_to_zip(archive, unique_id, ident, fullname, assignment):
+    fbk_path = os.path.join("feedback", str(unique_id), assignment)
+    
+    try:                                    
+        files = [os.path.join(fbk_path, f) for f in os.listdir(fbk_path) if f.endswith('.html')]
+        
+        assign_id = ident.strip('Participant ')
+        # remove asterisks
+        name = 'blank'
+        
+        # create the path to the feedback file
+        for f in files:
+            archive.write(f, arcname=os.path.join(f"{fullname}_{assign_id}_assignsubmission_file_", os.path.basename(f)))
+        
+    except FileNotFoundError:
+        logger.error(f"HTML feedback file for {fullname} {unique_id} {assignment} is missing")
+        # no feedback to generate
+
+
+def update_grade(out_df, index, unique_id, fullname, submission):
+    out_df.loc[index, 'Grade'] = submission.score
+
+    # warn about dubious scores
+    if submission.score <= 0 or submission.score > submission.max_score:
+        logger.warning(f"Warning: {unique_id} {fullname} has a score of {submission.score}")
+
+    # correct the maximum grade
+    out_df.loc[index, 'Maximum Grade'] = submission.max_score
 
 def moodle_gradesheet(assignment, with_feedback=True):    
     
     api = NbGraderAPI()
     gradebook = api.gradebook        
-    csvfile = os.path.join("imports", assignment+".csv")
-    with open(csvfile, newline='', encoding='utf-8-sig') as f:
-        reader = csv.DictReader(f) 
+    csvfile = os.path.join("imports", assignment + ".csv")
+    grading_df = pd.read_csv(csvfile)
     
-        fname =  os.path.join("exports", assignment+".csv")
-        
-        if with_feedback:
-            archive = zipfile.ZipFile(os.path.join("exports", "feedback_"+assignment+".zip"), 'w', zipfile.ZIP_DEFLATED)
-                
-        
-        with open(fname, 'w', encoding='utf-8', newline='') as out:
-            writer = csv.DictWriter(out, reader.fieldnames)
-            writer.writeheader()
-            for line in reader:        
-                email, ident, fullname, status, grade, max_grade = line["Email address"], line['Identifier'], line['Full name'], line['Status'], line['Grade'], line['Maximum Grade']                        
-                unique_id = email[0:7]
-                try:
-                    submission = gradebook.find_submission(assignment, unique_id)                
-                except:
-                    if "Submitted" in status:
-                        print("WARNING: No submission for {id} in assignment {assign}".format(id=unique_id ,assign=assignment))
-                    else:
-                        if verbose:
-                            print("\tNo submission for {id} in assignment {assign}, as expected".format(id=unique_id, assign=assignment))
-                else:
-                    if verbose:
-                        print("\tProcessing submission for {id} in assignment {assign}".format(id=unique_id, assign=assignment))
-
-
-                    fbk_path = os.path.join("feedback", unique_id, assignment)
-                    
-                    try:                    
-                        
-                        files = [os.path.join(fbk_path, f) for f in os.listdir(fbk_path) if f.endswith('.html')]
-                        
-                        assign_id = ident[-7:]
-                        # remove asterisks
-                        name = 'blank'
-                        
-                        # create the path to the feedback file
-                        fbk_full_path = "{fullname}_{assign_id}_assignsubmission_file_".format(fullname=name, 
-                            assign_id=assign_id)
-                        for f in files:
-                            archive.write(f, arcname=os.path.join(fbk_full_path, os.path.basename(f)))
-                        
-                    except FileNotFoundError:
-                        print("HTML feedback file for {fullname} {id} {assign} is missing".format(id=unique_id,
-                        fullname=fullname, assign=assignment))
-                        # no feedback to generate
-                
-                    line['Grade'] = submission.score
-
-                    # warn about dubious scores
-                    if line['Grade']<=0 or line['Grade']>submission.max_score:
-                        print("Warning: {matric} {name} has a score of {grade}".format(matric=unique_id,
-                        name=fullname, grade=line['Grade']))
-
-                    # correct the maximum grade
-                    line['Maximum Grade'] = submission.max_score
-                    writer.writerow(line)
-                
-            print("Wrote to {0}".format(fname))
-
-            # tidy up the feedback file
-            if with_feedback:
-                archive.close()
-                    
-            
-if __name__=="__main__":
-    if len(sys.argv)!=2:
-            print("""
-            Usage:
-            
-                update_gradesheet.py <assign> 
-                
-            Updates a CSV file gradesheet (which must have be downloaded from
-            Moodle with "offline gradesheets" enabled in the assignment settings) with
-            the results from grading the assignment <assign>.
-            
-            The input will be imports/<assign>.csv
-            The output will be in exports/<assign>.csv
-            
-            Feedback will be zipped up into the file exports/<assign>_feedback.zip and this
-            can be uploaded to Moodle if "Feedback files" is enabled. This uploads all student
-            feedback in one go.
-            
-            """)
-            exit(-1)
+    fname =  os.path.join("exports", assignment + ".csv")
     
-    assignment= sys.argv[1]
-    print("Updating gradesheet for {0}...".format(assignment))
-    moodle_gradesheet(assignment)
+    if with_feedback:
+        archive = zipfile.ZipFile(os.path.join("exports", "feedback_"+assignment+".zip"), 'w', zipfile.ZIP_DEFLATED)
+        
+    out_df = grading_df.copy()   
+     # these are the students that are grouped
+    grading_df['actual_group'] = grading_df['Group']
+    individuals = (grading_df['Department'] == grading_df['Group']) | (grading_df['Group'] == 'Default group')
+    grading_df.loc[individuals, 'actual_group'] = grading_df.loc[individuals, 'Identifier']   
+    n_groups = len(grading_df['actual_group'].unique())
+
+    for index, line in grading_df.drop_duplicates(subset='actual_group').iterrows():   
+        if line['actual_group'] == 'Default Group':
+            continue
+
+        try:
+            submission = gradebook.find_submission(assignment, line['ID number'])                
+        except:
+            if "Submitted" in line['Status']:
+                logger.warning(f"No submission for {line['ID number']} in assignment {assignment}")
+            else:
+                logger.info(f"No submission for {line['ID number']} in assignment {assignment}, as expected")
+        else:
+            logger.info(f"Processing submission for {line['ID number']} in assignment {assignment}")
+
+            # add feedback and grading to all students with the same submission in the same group
+
+            for group_index, group_line in grading_df[grading_df['actual_group'] == line['actual_group']].iterrows():
+                if with_feedback:
+                    add_feedback_to_zip(archive, line['ID number'], group_line['Identifier'], group_line['Full name'], assignment)
+
+                update_grade(out_df, group_index, group_line['ID number'], group_line['Full name'], submission)
+            
+    out_df.to_csv(fname, index=False)
+    logger.info(f"Wrote to {fname}")
+
+    # tidy up the feedback file
+    if with_feedback:
+        archive.close()
+                    
+
+import argparse
+
+parser = argparse.ArgumentParser(description='''
+    Updates a CSV file gradesheet (which must have be downloaded from
+    Moodle with "offline gradesheets" enabled in the assignment settings) with
+    the results from grading the assignment <assign>.
+
+    The input will be imports/<assign>.csv
+    The output will be in exports/<assign>.csv
+            
+    Feedback will be zipped up into the file exports/<assign>_feedback.zip and this
+    can be uploaded to Moodle if "Feedback files" is enabled. This uploads all student
+    feedback in one go.
+''')
+
+parser.add_argument('assignment', type=str, help='Name of the assignment csv file downloaded from moodle')
+
+args = parser.parse_args()
+
+moodle_gradesheet(args.assignment)
     
